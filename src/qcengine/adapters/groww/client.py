@@ -42,11 +42,11 @@ class GrowwClient:
     """Encapsulate Groww SDK calls and normalize error handling."""
 
     def __init__(self, config: GrowwClientConfig, api_factory: Callable[[str], Any] | None = None) -> None:
+        self.provider_name = "groww"
         self._config = config
         self._api_factory = api_factory or GrowwAPI
         token = config.access_token or self._generate_access_token()
         self._api = self._api_factory(token)
-        self.provider_name = "groww"
 
     def ping(self) -> None:
         """Verify the token is usable by calling a lightweight endpoint."""
@@ -73,6 +73,8 @@ class GrowwClient:
         interval = _map_timeframe_to_interval(timeframe)
 
         attempt = 0
+        operation = "get_historical_candles"
+
         while True:
             attempt += 1
             try:
@@ -100,17 +102,20 @@ class GrowwClient:
                 )
                 return raw
             except Exception as exc:  # noqa: BLE001
-                mapped = self._map_exception("get_historical_candles", exc)
+                mapped = self._map_exception(operation, exc)
                 if isinstance(mapped, (RateLimited, Unavailable)) and attempt < self._config.max_retries:
                     sleep_for = self._config.retry_backoff_base_s * (2 ** (attempt - 1))
                     logger.warning(
                         "retrying groww historical fetch",
                         extra={
+                            "operation": operation,
+                            "retry": attempt,
                             "symbol": instrument.provider_symbol,
                             "timeframe": timeframe.value,
-                            "attempt": attempt,
+                            "max_retries": self._config.max_retries,
                             "sleep": sleep_for,
                             "error": str(mapped),
+                            "error_type": type(mapped).__name__,
                         },
                     )
                     time.sleep(sleep_for)
@@ -132,7 +137,7 @@ class GrowwClient:
     def _map_exception(self, operation: str, exc: Exception) -> Exception:
         """Translate Groww SDK exceptions into QC-Engine adapter errors."""
 
-        message = f"{operation} failed"
+        message = f"{operation} failed: {self._format_exception_detail(exc)}"
         if isinstance(exc, (groww_exceptions.GrowwAPIAuthenticationException, groww_exceptions.GrowwAPIAuthorisationException)):
             return AuthError(self.provider_name, message, cause=exc)
         if isinstance(exc, groww_exceptions.GrowwAPIRateLimitException):
@@ -141,8 +146,24 @@ class GrowwClient:
             return Unavailable(self.provider_name, message, cause=exc)
         if isinstance(exc, groww_exceptions.GrowwAPIException):
             # Generic Groww error surfaced as invalid or forbidden payload
-            return InvalidResponse(self.provider_name, str(exc), cause=exc)
+            return InvalidResponse(self.provider_name, message, cause=exc)
         return Unavailable(self.provider_name, message, cause=exc)
+
+    @staticmethod
+    def _format_exception_detail(exc: Exception) -> str:
+        exc_type = type(exc).__name__
+        code = getattr(exc, "code", None)
+        message = getattr(exc, "message", None)
+        parts = [exc_type]
+        if code:
+            parts.append(f"code={code}")
+        if message:
+            parts.append(f"message={message}")
+
+        rendered = " ".join(parts)
+        if not message:
+            rendered = f"{rendered} ({str(exc)})" if str(exc) else rendered
+        return rendered
 
 
 def _format_dt(dt_utc: datetime) -> str:
