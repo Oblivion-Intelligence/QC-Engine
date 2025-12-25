@@ -140,7 +140,10 @@ def normalize_dataframe(
 
 
 def _extract_timestamp(row: Mapping | Sequence, spec: NormalizationSpec) -> datetime:
-    ts = _extract_value(row, spec.timestamp)
+    try:
+        ts = _extract_value(row, spec.timestamp)
+    except KeyError as exc:
+        raise ValueError("timestamp field missing") from exc
     if isinstance(ts, (int, float)):
         seconds = ts / 1000 if spec.epoch_ms else ts
         return ensure_utc(datetime.fromtimestamp(seconds, tz=timezone.utc))
@@ -152,7 +155,10 @@ def _extract_timestamp(row: Mapping | Sequence, spec: NormalizationSpec) -> date
 
 
 def _extract_numeric(row: Mapping | Sequence, key: str | int) -> float:
-    value = _extract_value(row, key)
+    try:
+        value = _extract_value(row, key)
+    except KeyError as exc:
+        raise ValueError("numeric field missing") from exc
     return float(value)
 
 
