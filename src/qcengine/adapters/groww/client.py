@@ -1,154 +1,165 @@
-# `src/qcengine/adapters/groww/client.py` — Pseudocode Spec (Phase 1)
+"""Lightweight Groww client wrapper with QC-Engine error mapping."""
 
-## Purpose
+from __future__ import annotations
 
-Encapsulate all direct interaction with `growwapi` and expose a stable, minimal client surface to the Groww adapter modules (`marketdata.py`, later `execution.py`).
+import logging
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Callable
 
-**Hard boundary:** only files under `adapters/groww/` import `growwapi`.
+from growwapi import GrowwAPI
+from growwapi.groww import exceptions as groww_exceptions
 
----
+from qcengine.adapters.base import AuthError, InstrumentRef, InvalidResponse, RateLimited, Unavailable
+from qcengine.domain.marketdata import Timeframe, ensure_utc
 
-## Imports (conceptual)
+logger = logging.getLogger(__name__)
 
-* `from growwapi import GrowwAPI` (or correct SDK entrypoint)
-* `from datetime import datetime`
-* `from typing import Any`
-* `from qcengine.adapters.base import InstrumentRef`
-* `from qcengine.domain.marketdata import Timeframe`
-* `from qcengine.adapters.base import AuthError, RateLimited, Unavailable, InvalidResponse`
 
-Optional utilities:
+@dataclass(frozen=True)
+class GrowwClientConfig:
+    """Configuration for :class:`GrowwClient`.
 
-* `from qcengine.utils.retry import retry_with_backoff` (or implement a local minimal retry helper)
-* `from qcengine.utils.logging import get_logger`
+    Either ``access_token`` or ``api_key`` must be provided. If ``api_secret``
+    accompanies ``api_key``, the client will generate a fresh access token via
+    the Groww SDK before making requests.
+    """
 
----
+    api_key: str | None = None
+    api_secret: str | None = None
+    access_token: str | None = None
+    timeout_s: float = 10.0
+    max_retries: int = 3
+    retry_backoff_base_s: float = 0.5
 
-## Config (minimal)
+    def __post_init__(self) -> None:
+        if not self.access_token and not self.api_key:
+            raise ValueError("either access_token or api_key must be provided")
 
-### `@dataclass(frozen=True) class GrowwClientConfig`
 
-Fields (Phase 1):
+class GrowwClient:
+    """Encapsulate Groww SDK calls and normalize error handling."""
 
-* `auth_token: str`  (provided externally via env/config)
-* optional:
+    def __init__(self, config: GrowwClientConfig, api_factory: Callable[[str], Any] | None = None) -> None:
+        self._config = config
+        self._api_factory = api_factory or GrowwAPI
+        token = config.access_token or self._generate_access_token()
+        self._api = self._api_factory(token)
+        self.provider_name = "groww"
 
-  * `timeout_s: float = 10.0`
-  * `max_retries: int = 3`
-  * `retry_backoff_base_s: float = 0.5`
+    def ping(self) -> None:
+        """Verify the token is usable by calling a lightweight endpoint."""
 
-**Invariant:** `auth_token` non-empty.
+        try:
+            self._api.get_user_profile(timeout=int(self._config.timeout_s))
+        except Exception as exc:  # noqa: BLE001
+            raise self._map_exception("get_user_profile", exc)
 
----
+    def get_historical_candles_raw(
+        self,
+        instrument: InstrumentRef,
+        timeframe: Timeframe,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> Any:
+        """Fetch raw candle payload from Groww with retry semantics."""
 
-## Class: `GrowwClient`
+        if not instrument.exchange or not instrument.segment:
+            raise InvalidResponse(self.provider_name, "exchange and segment are required for Groww historical data")
 
-### Constructor
+        start = _format_dt(start_utc)
+        end = _format_dt(end_utc)
+        interval = _map_timeframe_to_interval(timeframe)
 
-`def __init__(self, config: GrowwClientConfig):`
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                raw = self._api.get_historical_candles(
+                    instrument.exchange,
+                    instrument.segment,
+                    instrument.provider_symbol,
+                    start,
+                    end,
+                    interval,
+                    timeout=int(self._config.timeout_s),
+                )
+                logger.info(
+                    "groww historical candles fetched",
+                    extra={
+                        "symbol": instrument.provider_symbol,
+                        "exchange": instrument.exchange,
+                        "segment": instrument.segment,
+                        "timeframe": timeframe.value,
+                        "start": start,
+                        "end": end,
+                        "attempt": attempt,
+                        "rows": len(raw.get("candles", [])) if isinstance(raw, dict) else None,
+                    },
+                )
+                return raw
+            except Exception as exc:  # noqa: BLE001
+                mapped = self._map_exception("get_historical_candles", exc)
+                if isinstance(mapped, (RateLimited, Unavailable)) and attempt < self._config.max_retries:
+                    sleep_for = self._config.retry_backoff_base_s * (2 ** (attempt - 1))
+                    logger.warning(
+                        "retrying groww historical fetch",
+                        extra={
+                            "symbol": instrument.provider_symbol,
+                            "timeframe": timeframe.value,
+                            "attempt": attempt,
+                            "sleep": sleep_for,
+                            "error": str(mapped),
+                        },
+                    )
+                    time.sleep(sleep_for)
+                    continue
+                raise mapped
 
-* Store config.
-* Instantiate SDK client:
+    def _generate_access_token(self) -> str:
+        api_key = self._config.api_key
+        api_secret = self._config.api_secret
+        if not api_key:
+            raise ValueError("api_key is required when access_token is not provided")
 
-  * `self._api = GrowwAPI(config.auth_token)` (or equivalent)
-* Prepare logger.
+        try:
+            sdk = self._api_factory(api_key)
+            return sdk.get_access_token(api_key, secret=api_secret)
+        except Exception as exc:  # noqa: BLE001
+            raise self._map_exception("get_access_token", exc)
 
-**Do not** do network calls in `__init__`.
+    def _map_exception(self, operation: str, exc: Exception) -> Exception:
+        """Translate Groww SDK exceptions into QC-Engine adapter errors."""
 
----
+        message = f"{operation} failed"
+        if isinstance(exc, (groww_exceptions.GrowwAPIAuthenticationException, groww_exceptions.GrowwAPIAuthorisationException)):
+            return AuthError(self.provider_name, message, cause=exc)
+        if isinstance(exc, groww_exceptions.GrowwAPIRateLimitException):
+            return RateLimited(self.provider_name, message, cause=exc)
+        if isinstance(exc, (groww_exceptions.GrowwAPITimeoutException, TimeoutError)):
+            return Unavailable(self.provider_name, message, cause=exc)
+        if isinstance(exc, groww_exceptions.GrowwAPIException):
+            # Generic Groww error surfaced as invalid or forbidden payload
+            return InvalidResponse(self.provider_name, str(exc), cause=exc)
+        return Unavailable(self.provider_name, message, cause=exc)
 
-## Method: `ping() -> None`
 
-Purpose: verify token is valid and API reachable (lightweight).
+def _format_dt(dt_utc: datetime) -> str:
+    dt = ensure_utc(dt_utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-**Implementation approach**
 
-* Call a cheap endpoint (whichever is simplest in SDK):
-
-  * e.g., `get_user_profile()` or similar.
-* If success: return `None`.
-* Map failures to normalized exceptions:
-
-  * auth/token invalid → `AuthError(provider="groww", ...)`
-  * network timeout/connection → `Unavailable(...)`
-  * rate limit → `RateLimited(...)`
-  * unexpected response shape → `InvalidResponse(...)`
-
-**No retries** unless you want a single retry on network errors.
-
----
-
-## Method: `get_historical_candles_raw(...) -> Any`
-
-Signature (Phase 1):
-`def get_historical_candles_raw(self, instrument: InstrumentRef, timeframe: Timeframe, start_utc: datetime, end_utc: datetime) -> Any:`
-
-**Behavior contract**
-
-* This returns the **raw** payload from Groww SDK, unnormalized.
-* It does not return `Candle` objects; that conversion happens in `marketdata.py`.
-
-**Input requirements**
-
-* `start_utc` and `end_utc` must be timezone-aware UTC datetimes.
-* `instrument.provider_symbol` must be whatever Groww expects for the trading symbol parameter.
-* Groww may require exchange/segment/product parameters:
-
-  * if those are required, read them from `instrument.exchange` / `instrument.segment`
-  * if instrument lacks them, raise `InvalidResponse` or a custom `AdapterError` with a clear message.
-
-**Call shape (conceptual)**
-
-* Convert datetimes to the string format Groww expects:
-
-  * `"YYYY-MM-DD HH:MM:SS"` or epoch seconds (follow SDK docs).
-* Convert timeframe to Groww interval minutes:
-
-  * `interval = timeframe.to_minutes()` (but only if Groww supports that interval)
-* Call SDK method:
-
-  * `self._api.get_historical_candles(trading_symbol=instrument.provider_symbol, exchange=..., segment=..., start_time=..., end_time=..., interval_in_minutes=interval)`
-* Return SDK response.
-
-**Error mapping**
-
-* If SDK raises an auth exception / returns 401: raise `AuthError("groww", ...)`
-* If rate limited / 429: raise `RateLimited("groww", ...)`
-* If network error / timeout: raise `Unavailable("groww", ...)`
-* If response is missing expected keys / is empty in an invalid way: raise `InvalidResponse("groww", ...)`
-
-**Retries**
-
-* Retry only for:
-
-  * `RateLimited` (with backoff)
-  * `Unavailable` (with backoff)
-* Do not retry `AuthError` or `InvalidResponse`.
-
-**Logging**
-
-* Log at info:
-
-  * provider, symbol, timeframe, start/end, interval, result count if available.
-* Log at warning on retries.
-
----
-
-## Helper: `_format_dt(dt_utc: datetime) -> str`
-
-* Ensure dt is UTC aware; otherwise raise.
-* Return in Groww-required format. Keep it centralized.
-
-## Helper: `_map_timeframe_to_interval_minutes(timeframe: Timeframe) -> int`
-
-* If timeframe not supported (e.g., 1h not supported): raise `InvalidResponse` with message “unsupported timeframe for Groww historical”.
-
----
-
-## Done criteria (Codex must satisfy)
-
-* `GrowwClient` compiles with minimal external dependencies.
-* No provider normalization here (no `Candle` creation).
-* All exceptions raised are from `qcengine.adapters.base` taxonomy.
-* Works with a fake/mocked SDK in unit tests (design for injectability if possible).
+def _map_timeframe_to_interval(timeframe: Timeframe) -> str:
+    mapping = {
+        Timeframe.MIN_1: GrowwAPI.CANDLE_INTERVAL_MIN_1,
+        Timeframe.MIN_5: GrowwAPI.CANDLE_INTERVAL_MIN_5,
+        Timeframe.MIN_15: GrowwAPI.CANDLE_INTERVAL_MIN_15,
+        Timeframe.HOUR_1: GrowwAPI.CANDLE_INTERVAL_HOUR_1,
+        Timeframe.DAY_1: GrowwAPI.CANDLE_INTERVAL_DAY,
+    }
+    try:
+        return mapping[timeframe]
+    except KeyError as exc:  # pragma: no cover - invalid path
+        raise InvalidResponse("groww", f"unsupported timeframe: {timeframe}") from exc
 
