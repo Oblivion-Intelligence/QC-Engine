@@ -1,150 +1,152 @@
-## `src/qcengine/adapters/yfinance/marketdata.py` — Pseudocode Spec (Phase 1, fail-fast)
+from __future__ import annotations
 
-### Purpose
+"""yfinance historical candle adapter implementation."""
 
-Implement `YFinanceMarketDataAdapter` that conforms to `MarketDataAdapter` and converts yfinance historical data into canonical `Candle` objects.
+from datetime import datetime, timezone
+from typing import Iterable
 
-**Fail-fast policy:** any malformed response, missing columns, invalid timestamps, invalid OHLC ⇒ raise `InvalidResponse`.
+import pandas as pd
+import yfinance as yf
 
----
+from qcengine.adapters.base import (
+    AdapterError,
+    InvalidResponse,
+    MarketDataAdapter,
+    InstrumentRef,
+    RateLimited,
+    Unavailable,
+)
+from qcengine.domain.marketdata import Candle, Timeframe, ensure_utc, now_utc
 
-## Imports (conceptual)
 
-* `from datetime import datetime`
-* `from typing import List`
-* `import yfinance as yf`
-* `import pandas as pd` (yfinance returns DataFrame; treat as such)
-* `from qcengine.adapters.base import MarketDataAdapter, InstrumentRef`
-* `from qcengine.adapters.base import RateLimited, Unavailable, InvalidResponse, AdapterError`
-* `from qcengine.domain.marketdata import Candle, Timeframe, ensure_utc, now_utc`
+_INTERVAL_MAP: dict[Timeframe, str] = {
+    Timeframe.MIN_1: "1m",
+    Timeframe.MIN_5: "5m",
+    Timeframe.MIN_15: "15m",
+    Timeframe.HOUR_1: "60m",
+    Timeframe.DAY_1: "1d",
+}
 
-(Optional logger)
 
----
+class YFinanceMarketDataAdapter(MarketDataAdapter):
+    """Adapter for fetching historical candles from yfinance."""
 
-## Class: `YFinanceMarketDataAdapter`
+    provider_name: str = "yfinance"
 
-### Attributes
+    def ping(self) -> None:  # pragma: no cover - network reachability is environment dependent
+        try:
+            ticker = yf.Ticker("AAPL")
+            ticker.history(period="1d", interval="1d", auto_adjust=False, prepost=False, raise_errors=True)
+        except Exception as exc:  # noqa: BLE001 - we normalize to adapter errors
+            raise Unavailable(self.provider_name, "yfinance ping failed", cause=exc) from exc
 
-* `provider_name: str = "yfinance"`
+    def get_historical_candles(
+        self,
+        instrument: InstrumentRef,
+        timeframe: Timeframe,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> list[Candle]:
+        instrument_id = instrument.instrument_id.strip()
+        provider_symbol = instrument.provider_symbol.strip()
+        if not instrument_id or not provider_symbol:
+            raise InvalidResponse(self.provider_name, "instrument_id and provider_symbol are required")
 
-### `__init__(self)`
+        start_utc = ensure_utc(start_utc)
+        end_utc = ensure_utc(end_utc)
+        if start_utc >= end_utc:
+            raise InvalidResponse(self.provider_name, "start_utc must be earlier than end_utc")
 
-* no special config required initially
+        try:
+            interval = _INTERVAL_MAP[timeframe]
+        except KeyError as exc:
+            raise InvalidResponse(self.provider_name, f"unsupported timeframe: {timeframe}") from exc
 
-### `ping(self) -> None` (optional)
+        try:
+            df = self._download(provider_symbol, interval, start_utc, end_utc)
+        except RateLimited:
+            raise
+        except Unavailable:
+            raise
+        except AdapterError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalize to adapter taxonomy
+            raise Unavailable(self.provider_name, "yfinance history request failed", cause=exc) from exc
 
-* Perform a minimal call (e.g., fetch a tiny range for a known symbol) OR skip ping in Phase 1.
-* If implemented: network errors ⇒ `Unavailable`.
+        if df.empty:
+            return []
 
----
+        self._validate_columns(df)
 
-## Core method: `get_historical_candles(...)`
+        index = df.index
+        if index.tz is None:
+            raise InvalidResponse(self.provider_name, "yfinance returned naive timestamps")
 
-Signature:
-`def get_historical_candles(self, instrument: InstrumentRef, timeframe: Timeframe, start_utc: datetime, end_utc: datetime) -> List[Candle]:`
+        df = df.sort_index()
+        available_ts = now_utc()
+        candles: list[Candle] = []
 
-### Preconditions (fail-fast)
+        for ts, row in df.iterrows():
+            ts_utc = ensure_utc(ts.to_pydatetime())
+            try:
+                candles.append(
+                    Candle(
+                        instrument_id=instrument_id,
+                        timeframe=timeframe,
+                        bar_start_ts_utc=ts_utc,
+                        open=float(row["Open"]),
+                        high=float(row["High"]),
+                        low=float(row["Low"]),
+                        close=float(row["Close"]),
+                        volume=None if "Volume" not in row else float(row["Volume"]),
+                        source=self.provider_name,
+                        available_ts_utc=available_ts,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise InvalidResponse(self.provider_name, "failed to normalize yfinance candle", cause=exc) from exc
 
-1. `instrument.instrument_id` and `instrument.provider_symbol` non-empty, else `InvalidResponse`
-2. Ensure UTC inputs:
+        self._assert_sorted(candles)
+        return candles
 
-   * `start_utc = ensure_utc(start_utc)`
-   * `end_utc = ensure_utc(end_utc)`
-3. `start_utc < end_utc` else `ValueError` or `InvalidResponse`
+    def _download(
+        self, provider_symbol: str, interval: str, start_utc: datetime, end_utc: datetime
+    ) -> pd.DataFrame:
+        try:
+            df = yf.download(
+                tickers=provider_symbol,
+                interval=interval,
+                start=start_utc.astimezone(timezone.utc).replace(tzinfo=None),
+                end=end_utc.astimezone(timezone.utc).replace(tzinfo=None),
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                prepost=False,
+                raise_errors=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc).lower()
+            if "429" in message or "rate limit" in message:
+                raise RateLimited(self.provider_name, "yfinance rate limited", cause=exc) from exc
+            raise Unavailable(self.provider_name, "yfinance download failed", cause=exc) from exc
 
-### Steps
+        if isinstance(df, pd.DataFrame) and isinstance(df.columns, pd.MultiIndex):
+            # When group_by="ticker" but single ticker, columns may be multi-indexed
+            df = df.xs(provider_symbol, axis=1)
 
-1. Convert timeframe to yfinance interval string:
+        if not isinstance(df, pd.DataFrame):
+            raise InvalidResponse(self.provider_name, "yfinance returned non-DataFrame response")
+        return df
 
-   * map:
+    def _validate_columns(self, df: pd.DataFrame) -> None:
+        required = {"Open", "High", "Low", "Close"}
+        missing = required.difference(df.columns)
+        if missing:
+            raise InvalidResponse(self.provider_name, f"missing required columns: {sorted(missing)}")
 
-     * `MIN_1 -> "1m"`
-     * `MIN_5 -> "5m"`
-     * `MIN_15 -> "15m"`
-     * `HOUR_1 -> "60m"` (yfinance uses "60m")
-     * `DAY_1 -> "1d"`
-   * if timeframe unsupported by yfinance: raise `InvalidResponse("yfinance", "...unsupported timeframe...")`
-
-2. Prepare request times:
-
-   * yfinance `download()` expects naive timestamps in local? It handles timezone; to avoid ambiguity:
-
-     * convert UTC datetimes to ISO strings (UTC) or pass as `datetime` objects (ensure tz-aware)
-   * If the library forces naive: explicitly convert to UTC naive and document it in code, but keep internal Candle timestamps UTC-aware.
-
-3. Fetch data:
-
-   * Use one of:
-
-     * `yf.download(tickers=instrument.provider_symbol, start=..., end=..., interval=..., auto_adjust=False, progress=False, group_by="ticker")`
-     * or `yf.Ticker(symbol).history(start=..., end=..., interval=..., auto_adjust=False)`
-   * Choose one and stick to it (recommend `Ticker().history` for single symbol).
-
-4. Validate DataFrame:
-
-   * Must be non-empty else return `[]` (allowed)
-   * Must contain required columns:
-
-     * `Open`, `High`, `Low`, `Close`
-     * `Volume` optional (but generally present)
-   * If missing required columns: raise `InvalidResponse`
-
-5. Normalize index timestamps:
-
-   * DataFrame index can be tz-aware or naive; enforce:
-
-     * convert index to UTC (`tz_convert("UTC")` if tz-aware)
-     * if naive: interpret as UTC (fail-fast vs assume):
-
-       * **Preferred fail-fast**: if naive, raise `InvalidResponse("yfinance", "naive timestamps from yfinance")`
-       * If yfinance consistently gives naive, you may choose to treat as UTC; but that is a semantics decision. For now: **fail-fast**.
-
-6. Convert each row into a Candle:
-   For each timestamp `ts` and row:
-
-   * `bar_start_ts_utc = ensure_utc(ts.to_pydatetime())`
-   * parse OHLC as floats
-   * parse volume:
-
-     * if Volume column present: float(row["Volume"])
-     * else None
-   * create `Candle`:
-
-     * `instrument_id = instrument.instrument_id`
-     * `timeframe = timeframe`
-     * `bar_start_ts_utc = bar_start_ts_utc`
-     * `open/high/low/close/volume`
-     * `source = "yfinance"`
-     * `available_ts_utc = now_utc()` (single timestamp per call is fine)
-
-7. Ensure candles sorted ascending by `bar_start_ts_utc`:
-
-   * DataFrame is typically ordered; still enforce:
-
-     * sort by timestamp and return list
-
-8. Return list
-
----
-
-## Error mapping (best-effort)
-
-yfinance doesn’t reliably throw typed rate-limit exceptions; failures are usually generic network issues.
-
-* Network / HTTP / timeout / connection errors ⇒ `Unavailable(provider="yfinance", ...)`
-* Anything that indicates throttling (if detectable) ⇒ `RateLimited` (optional; otherwise treat as `Unavailable`)
-* Schema/columns/timestamps issues ⇒ `InvalidResponse`
-
----
-
-## Done criteria
-
-* Returns list of `Candle` objects that satisfy:
-
-  * UTC-aware timestamps
-  * correct OHLC + validation
-  * sorted ascending
-  * `source == "yfinance"`
-* Empty history returns `[]`
-* Missing columns or naive timestamp handling follows fail-fast policy (raise)
+    def _assert_sorted(self, candles: Iterable[Candle]) -> None:
+        previous: datetime | None = None
+        for candle in candles:
+            if previous and candle.bar_start_ts_utc < previous:
+                raise InvalidResponse(self.provider_name, "candles must be sorted by bar_start_ts_utc")
+            previous = candle.bar_start_ts_utc
