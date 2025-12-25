@@ -1,126 +1,97 @@
-# `src/qcengine/adapters/base.py` — Pseudocode Spec (Phase 1)
+"""Adapter contracts and canonical adapter errors."""
 
-## Purpose
+from __future__ import annotations
 
-##Define **provider-agnostic adapter contracts** and **normalized adapter errors**.
-##All ingestion code calls these interfaces; provider code implements them.
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol, runtime_checkable
 
----
+from qcengine.domain.marketdata import Candle, Timeframe
 
-## Imports (conceptual)
 
-* `from qcengine.domain.marketdata import Candle, Timeframe`
-* `from dataclasses import dataclass` (or pydantic)
-* `from typing import Protocol, runtime_checkable, Iterable`
-* `from datetime import datetime`
+class AdapterError(Exception):
+    """Base exception for all adapter failures.
 
----
+    Args:
+        provider: Provider identifier (e.g., "groww", "yfinance").
+        message: Human-readable error message.
+        cause: Optional underlying exception from the provider SDK or HTTP stack.
+    """
 
-## 1) Canonical adapter exceptions (normalized error taxonomy)
+    def __init__(self, provider: str, message: str, cause: Exception | None = None) -> None:
+        self.provider = provider
+        self.message = message
+        self.cause = cause
+        super().__init__(f"[{provider}] {message}")
 
-### `class AdapterError(Exception)`
 
-* Base exception for all adapter failures.
-* Has fields:
+class AuthError(AdapterError):
+    """Raised when authentication or tokens are invalid or expired."""
 
-  * `provider: str` (e.g., "groww", "yfinance")
-  * `message: str`
-  * optional `cause: Exception | None`
 
-### Subclasses (Phase 1 minimal set)
+class RateLimited(AdapterError):
+    """Raised when the provider rate limits the request (retry with backoff)."""
 
-* `class AuthError(AdapterError)`
-  Raised when auth/token invalid/expired.
-* `class RateLimited(AdapterError)`
-  Raised on rate limit; ingestion may retry with backoff.
-* `class Unavailable(AdapterError)`
-  Raised on network/service downtime/timeouts; retryable.
-* `class InvalidResponse(AdapterError)`
-  Raised when provider returns malformed/unexpected data; fail-fast.
 
-**Design note:** ingestion/backfill may treat `RateLimited` and `Unavailable` as retryable; others as terminal (per run).
+class Unavailable(AdapterError):
+    """Raised when the provider is temporarily unavailable or timing out."""
 
----
 
-## 2) Provider instrument reference (minimal for Phase 1)
+class InvalidResponse(AdapterError):
+    """Raised when the provider returns malformed or unexpected data."""
 
-### `@dataclass(frozen=True) class InstrumentRef`
 
-Represents a canonical instrument identity and the provider symbol needed by the adapter.
+@dataclass(frozen=True)
+class InstrumentRef:
+    """Canonical instrument identity plus provider-specific symbol."""
 
-Fields:
+    instrument_id: str
+    provider_symbol: str
+    exchange: str | None = None
+    segment: str | None = None
 
-* `instrument_id: str`
-  Internal stable ID used by your engine.
-* `provider_symbol: str`
-  The symbol string the provider expects (Groww or yfinance).
-* optional metadata fields (only if you already know you need them now):
+    def __post_init__(self) -> None:
+        if not self.instrument_id:
+            raise ValueError("instrument_id must be non-empty")
+        if not self.provider_symbol:
+            raise ValueError("provider_symbol must be non-empty")
 
-  * `exchange: str | None`
-  * `segment: str | None`
 
-**Invariants**
+@runtime_checkable
+class MarketDataAdapter(Protocol):
+    """Protocol for normalized historical market data adapters."""
 
-* `instrument_id` non-empty
-* `provider_symbol` non-empty
+    provider_name: str
 
----
+    def get_historical_candles(
+        self,
+        instrument: InstrumentRef,
+        timeframe: Timeframe,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> list[Candle]:
+        """Return canonical candles sorted ascending by ``bar_start_ts_utc``.
 
-## 3) Market data adapter interface (historical candles only)
+        Implementations must normalize provider data into :class:`~qcengine.domain.marketdata.Candle`
+        with fields:
+        ``instrument_id == instrument.instrument_id``, ``timeframe == timeframe``,
+        ``source == self.provider_name``, and ``available_ts_utc`` set at ingestion time.
 
-### `@runtime_checkable class MarketDataAdapter(Protocol)`
+        ``start_utc`` and ``end_utc`` are timezone-aware UTC datetimes.
 
-Properties / methods:
+        Raises:
+            AuthError: Authentication or token failure.
+            RateLimited: The provider is throttling requests.
+            Unavailable: Network, timeout, or provider outage; should be retried.
+            InvalidResponse: Provider returned malformed or unexpected data.
+        """
 
-#### `provider_name: str`
+    def ping(self) -> None:
+        """Optional health check; raise :class:`Unavailable` if the provider is unreachable."""
 
-* constant identifier, e.g., `"groww"` or `"yfinance"`
 
-#### `def get_historical_candles(self, instrument: InstrumentRef, timeframe: Timeframe, start_utc: datetime, end_utc: datetime) -> list[Candle]:`
+class InstrumentResolver(Protocol):
+    """Optional protocol to map canonical symbols to provider instrument references."""
 
-Behavior contract:
-
-* `start_utc` and `end_utc` are timezone-aware UTC datetimes (callers should pass UTC).
-* Returns **canonical** `Candle` objects:
-
-  * `instrument_id == instrument.instrument_id`
-  * `timeframe == timeframe`
-  * `source == self.provider_name`
-  * `available_ts_utc` set to “now_utc()” at normalization time
-* Returned candles must be **sorted ascending by `bar_start_ts_utc`**
-* If provider returns empty: return `[]` (do not throw)
-* Errors:
-
-  * auth failure → `AuthError`
-  * rate limit → `RateLimited`
-  * network/timeouts/service errors → `Unavailable`
-  * unexpected schema/data → `InvalidResponse`
-
-Optional (but useful) Phase 1 method:
-
-#### `def ping(self) -> None`
-
-* Raises `Unavailable` if provider is not reachable / auth invalid.
-* Used by health checks (optional).
-
----
-
-## 4) Optional: Instrument resolver interface (if you want it now)
-
-If you intend to keep symbol mapping clean:
-
-### `class InstrumentResolver(Protocol)`
-
-* `def resolve(self, canonical_symbol: str) -> InstrumentRef`
-* raises `AdapterError` on unknown mapping.
-
-You can skip implementing this interface until you actually need it, but the adapter integration is cleaner if you define it now.
-
----
-
-## Done criteria (Codex must satisfy)
-
-* `MarketDataAdapter` protocol compiles and is importable.
-* `InstrumentRef` exists and is frozen/immutable.
-* All adapter errors exist and can be caught by ingestion code uniformly.
-* No provider SDK imports here (this is a hard boundary).
+    def resolve(self, canonical_symbol: str) -> InstrumentRef:
+        """Return a provider instrument reference or raise :class:`AdapterError` if unknown."""
