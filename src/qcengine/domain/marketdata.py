@@ -1,112 +1,172 @@
-# `src/qcengine/domain/marketdata.py` — Pseudocode Spec (Phase 1)
+"""Canonical market data domain types and helpers."""
 
-## Purpose
+from __future__ import annotations
 
-##Define the canonical market data types used across the repo. Providers (Groww/yfinance) must normalize into these objects. Storage and plotting operate only on these objects.
+import math
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Dict, Optional, Tuple
 
----
 
-## Public API (exports)
+class Timeframe(Enum):
+    """Supported candle resolutions."""
 
-### 1) `Timeframe` (enum-like)
+    MIN_1 = "1m"
+    MIN_5 = "5m"
+    MIN_15 = "15m"
+    HOUR_1 = "1h"
+    DAY_1 = "1d"
 
-* Represents candle resolution.
-* Must support at least: `MIN_1`, `MIN_5`, `MIN_15`, `HOUR_1`, `DAY_1` (you can include fewer, but at minimum `MIN_1` and `DAY_1`).
-* Must provide:
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return self.value
 
-  * `to_minutes() -> int` (e.g., DAY_1 = 1440)
-  * `__str__`/`value` that can be used in filenames (e.g., `"1m"`, `"1d"`)
+    def to_minutes(self) -> int:
+        """Return the timeframe length in minutes."""
 
-**Pseudocode**
+        mapping = {
+            Timeframe.MIN_1: 1,
+            Timeframe.MIN_5: 5,
+            Timeframe.MIN_15: 15,
+            Timeframe.HOUR_1: 60,
+            Timeframe.DAY_1: 1440,
+        }
+        return mapping[self]
 
-* define `class Timeframe(Enum):`
+    @classmethod
+    def from_minutes(cls, minutes: int) -> "Timeframe":
+        """Create a timeframe from the number of minutes.
 
-  * members map to string codes: `"1m"`, `"5m"`, `"15m"`, `"1h"`, `"1d"`
-* `def to_minutes(self) -> int:`
+        Raises:
+            ValueError: If the provided minutes do not match a supported timeframe.
+        """
 
-  * map each to integer minutes
-* `@classmethod def from_minutes(cls, minutes: int) -> Timeframe:`
+        mapping = {
+            1: cls.MIN_1,
+            5: cls.MIN_5,
+            15: cls.MIN_15,
+            60: cls.HOUR_1,
+            1440: cls.DAY_1,
+        }
+        try:
+            return mapping[minutes]
+        except KeyError as exc:  # pragma: no cover - error path
+            raise ValueError(f"Unsupported timeframe: {minutes} minutes") from exc
 
-  * raise `ValueError` if unsupported (Phase 1)
 
----
+def ensure_utc(dt: datetime) -> datetime:
+    """Normalize a datetime to a timezone-aware UTC datetime.
 
-### 2) `Candle` (canonical OHLCV)
+    Args:
+        dt: Datetime to validate.
 
-A single bar. Canonical across all providers.
+    Returns:
+        Datetime converted to UTC.
 
-**Fields (required)**
+    Raises:
+        ValueError: If the datetime is naive (no timezone information).
+    """
 
-* `instrument_id: str`
-* `timeframe: Timeframe`
-* `bar_start_ts_utc: datetime`  (timezone-aware UTC)
-* `open: float`
-* `high: float`
-* `low: float`
-* `close: float`
-* `volume: float | None`
-* `source: str` (e.g., `"groww"`, `"yfinance"`)
-* `available_ts_utc: datetime` (timezone-aware UTC; set when ingested/normalized)
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ValueError("Datetime must be timezone-aware and set to UTC")
+    return dt.astimezone(timezone.utc)
 
-**Derived/utility**
 
-* `key() -> tuple[str, str, datetime]`
+def now_utc() -> datetime:
+    """Return the current timezone-aware UTC datetime."""
 
-  * returns `(instrument_id, timeframe.value, bar_start_ts_utc)`
-* `to_dict()` / `from_dict()` for parquet/json convenience (optional but recommended)
+    return datetime.now(timezone.utc)
 
-**Validation invariants**
 
-* `bar_start_ts_utc` MUST be timezone-aware and in UTC.
-* `available_ts_utc` MUST be timezone-aware and in UTC.
-* OHLC:
+@dataclass
+class Candle:
+    """Canonical OHLCV candle representation."""
 
-  * `high >= max(open, close, low)`
-  * `low <= min(open, close, high)`
-* `volume`:
+    instrument_id: str
+    timeframe: Timeframe
+    bar_start_ts_utc: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: Optional[float]
+    source: str
+    available_ts_utc: datetime
 
-  * if present, must be `>= 0`
-* Numeric values must be finite (no NaN/inf).
+    def __post_init__(self) -> None:
+        if not isinstance(self.timeframe, Timeframe):
+            try:
+                self.timeframe = Timeframe(self.timeframe)
+            except Exception as exc:  # pragma: no cover - invalid path
+                raise ValueError(f"Invalid timeframe: {self.timeframe}") from exc
 
-**Pseudocode**
+        self.bar_start_ts_utc = ensure_utc(self.bar_start_ts_utc)
+        self.available_ts_utc = ensure_utc(self.available_ts_utc)
 
-* implement as `pydantic.BaseModel` (or dataclass + manual checks)
-* add validators:
+        self._validate_numbers()
+        self._validate_ohlc()
+        self._validate_volume()
 
-  * ensure tz-aware + UTC (reject naive datetimes)
-  * ensure OHLC constraints
-  * ensure numeric finiteness
-* `def key(self): ...`
+    def _validate_numbers(self) -> None:
+        for field_name, value in {
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
+        }.items():
+            if not math.isfinite(value):
+                raise ValueError(f"{field_name} must be a finite number")
 
----
+        if self.volume is not None and not math.isfinite(self.volume):
+            raise ValueError("volume must be a finite number when provided")
 
-## Helper functions (module-private is fine)
+    def _validate_ohlc(self) -> None:
+        highest = max(self.open, self.close, self.low)
+        if self.high < highest:
+            raise ValueError("high must be >= open, close, and low")
 
-### `ensure_utc(dt: datetime) -> datetime`
+        lowest = min(self.open, self.close, self.high)
+        if self.low > lowest:
+            raise ValueError("low must be <= open, close, and high")
 
-* If `dt` is naive: raise `ValueError` (Phase 1 strict).
-* If aware but not UTC: convert to UTC.
-* Return normalized UTC datetime.
+    def _validate_volume(self) -> None:
+        if self.volume is not None and self.volume < 0:
+            raise ValueError("volume must be non-negative when provided")
 
-### `now_utc() -> datetime`
+    def key(self) -> Tuple[str, str, datetime]:
+        """Return the uniqueness key for storage and deduplication."""
 
-* Return current timezone-aware UTC timestamp.
+        return (self.instrument_id, self.timeframe.value, self.bar_start_ts_utc)
 
----
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the candle to a dictionary for storage/transport."""
 
-## Done criteria (Codex must satisfy)
+        return {
+            "instrument_id": self.instrument_id,
+            "timeframe": self.timeframe.value,
+            "bar_start_ts_utc": self.bar_start_ts_utc.isoformat(),
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
+            "volume": self.volume,
+            "source": self.source,
+            "available_ts_utc": self.available_ts_utc.isoformat(),
+        }
 
-* Can instantiate `Candle` with valid data.
-* Invalid timezone / naive timestamps raise a clear error.
-* Invalid OHLC relationships raise errors.
-* `Timeframe.to_minutes()` returns correct values.
-* `Candle.key()` returns stable uniqueness key as specified.
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Candle":
+        """Reconstruct a :class:`Candle` from :meth:`to_dict` output."""
 
----
-
-## Minimal tests to write later (just note here)
-
-* Creating Candle with naive `bar_start_ts_utc` fails.
-* Creating Candle with `high < open` fails.
-* `Timeframe("1d").to_minutes() == 1440`.
-* `Candle.key()` matches `(instrument_id, timeframe.value, bar_start_ts_utc)`.
+        return cls(
+            instrument_id=data["instrument_id"],
+            timeframe=Timeframe(data["timeframe"]),
+            bar_start_ts_utc=ensure_utc(datetime.fromisoformat(data["bar_start_ts_utc"])),
+            open=float(data["open"]),
+            high=float(data["high"]),
+            low=float(data["low"]),
+            close=float(data["close"]),
+            volume=None if data.get("volume") is None else float(data["volume"]),
+            source=data["source"],
+            available_ts_utc=ensure_utc(datetime.fromisoformat(data["available_ts_utc"])),
+        )
