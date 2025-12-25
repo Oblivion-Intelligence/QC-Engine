@@ -6,7 +6,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable, Protocol, Sequence
+from typing import Iterable, Sequence
 
 from qcengine.adapters.base import (
     AdapterError,
@@ -18,23 +18,9 @@ from qcengine.adapters.base import (
     Unavailable,
 )
 from qcengine.domain.marketdata import Candle, Timeframe, ensure_utc
+from qcengine.storage.base import AppendResult, CandleStore
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class AppendResult:
-    """Outcome of appending candles into a store."""
-
-    written: int
-    duplicates: int = 0
-
-
-class CandleStore(Protocol):
-    """Protocol describing the storage interface used by backfill."""
-
-    def append(self, candles: list[Candle]) -> AppendResult:
-        ...
 
 
 @dataclass
