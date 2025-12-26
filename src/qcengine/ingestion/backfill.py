@@ -24,6 +24,24 @@ from qcengine.storage.base import AppendResult, CandleStore
 logger = logging.getLogger(__name__)
 
 
+def clamp_candles_to_window(candles: Sequence[Candle], window: Window) -> list[Candle]:
+    """Filter candles to the half-open ``window`` while preserving order.
+
+    Candles are kept iff ``window.start_utc <= bar_start_ts_utc < window.end_utc``.
+    The returned list preserves the input order and asserts the sequence is sorted
+    by ``bar_start_ts_utc``.
+    """
+
+    filtered = [c for c in candles if window.contains(c.bar_start_ts_utc)]
+
+    for prev, curr in zip(filtered, filtered[1:]):
+        assert (
+            prev.bar_start_ts_utc <= curr.bar_start_ts_utc
+        ), "candles must be sorted by bar_start_ts_utc"
+
+    return filtered
+
+
 @dataclass
 class BackfillJob:
     adapter: MarketDataAdapter
@@ -47,13 +65,12 @@ class BackfillJob:
     def _run_single(
         self, instrument: InstrumentRef, timeframe: Timeframe, window: Window
     ) -> None:
-        candles = [
-            candle
-            for candle in self._fetch_with_retry(
+        candles = clamp_candles_to_window(
+            self._fetch_with_retry(
                 instrument, timeframe, window.start_utc, window.end_utc
-            )
-            if window.contains(candle.bar_start_ts_utc)
-        ]
+            ),
+            window,
+        )
         if not candles:
             logger.info(
                 "backfill returned no candles",

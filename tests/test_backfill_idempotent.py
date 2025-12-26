@@ -86,6 +86,19 @@ class _InclusiveEndAdapter:
         return [c for c in self.candles if start <= c.bar_start_ts_utc <= end]
 
 
+class _NoisyBoundaryAdapter:
+    provider_name = "noisy-boundaries"
+
+    def __init__(self, candles: list[Candle]):
+        self.candles = candles
+
+    def ping(self) -> None:  # pragma: no cover - not used here
+        return None
+
+    def get_historical_candles(self, instrument, timeframe, start_utc, end_utc):  # noqa: ANN001
+        return list(self.candles)
+
+
 def test_half_open_backfill_windows_are_stitchable(tmp_path) -> None:
     instrument = InstrumentRef("ABC", "ABC")
     timeframe = Timeframe.MIN_1
@@ -149,3 +162,44 @@ def test_half_open_backfill_windows_are_stitchable(tmp_path) -> None:
     assert len(full_result) == 3
     assert adapter_full.calls == 1
     assert adapter_split.calls == 2
+
+
+def test_backfill_clamps_provider_noise(tmp_path) -> None:
+    instrument = InstrumentRef("ABC", "ABC")
+    timeframe = Timeframe.MIN_1
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=3)
+
+    candles = [
+        Candle(
+            instrument_id=instrument.instrument_id,
+            timeframe=timeframe,
+            bar_start_ts_utc=start + timedelta(minutes=offset),
+            open=100 + offset,
+            high=101 + offset,
+            low=99 + offset,
+            close=100 + offset,
+            volume=1_000 + offset,
+            source="test",
+            available_ts_utc=start,
+        )
+        for offset in (-1, 0, 1, 2, 3, 4)
+    ]
+
+    adapter = _NoisyBoundaryAdapter(candles)
+    store = ParquetCandleStore(tmp_path / "clamped")
+
+    BackfillJob(
+        adapter=adapter,
+        storage=store,
+        instruments=[instrument],
+        timeframes=[timeframe],
+        start_utc=start,
+        end_utc=end,
+    ).run()
+
+    stored = store.read(instrument.instrument_id, timeframe)
+
+    assert [c.bar_start_ts_utc for c in stored] == [
+        start + timedelta(minutes=i) for i in (0, 1, 2)
+    ]
