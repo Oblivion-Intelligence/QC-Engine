@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """yfinance historical candle adapter implementation."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 import pandas as pd
@@ -32,6 +32,7 @@ class YFinanceMarketDataAdapter(MarketDataAdapter):
     """Adapter for fetching historical candles from yfinance."""
 
     provider_name: str = "yfinance"
+    timestamp_semantics: str = "bar_end"
 
     def ping(self) -> None:  # pragma: no cover - network reachability is environment dependent
         try:
@@ -87,7 +88,7 @@ class YFinanceMarketDataAdapter(MarketDataAdapter):
         candles: list[Candle] = []
 
         for ts, row in df.iterrows():
-            ts_utc = ensure_utc(ts.to_pydatetime())
+            ts_utc = _normalize_bar_timestamp(ts.to_pydatetime(), timeframe, self.timestamp_semantics)
             try:
                 candles.append(
                     Candle(
@@ -150,3 +151,20 @@ class YFinanceMarketDataAdapter(MarketDataAdapter):
             if previous and candle.bar_start_ts_utc < previous:
                 raise InvalidResponse(self.provider_name, "candles must be sorted by bar_start_ts_utc")
             previous = candle.bar_start_ts_utc
+
+
+def _normalize_bar_timestamp(ts: datetime, timeframe: Timeframe, timestamp_semantics: str) -> datetime:
+    ts_utc = ensure_utc(ts)
+    if timestamp_semantics == "bar_end":
+        ts_utc -= timedelta(minutes=timeframe.to_minutes())
+    _assert_aligned_to_timeframe(ts_utc, timeframe)
+    return ts_utc
+
+
+def _assert_aligned_to_timeframe(ts: datetime, timeframe: Timeframe) -> None:
+    delta_seconds = timeframe.to_minutes() * 60
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    remainder = (ts - epoch).total_seconds() % delta_seconds
+    tolerance = 1e-6
+    if remainder > tolerance and abs(delta_seconds - remainder) > tolerance:
+        raise InvalidResponse("yfinance", f"candle timestamp {ts.isoformat()} not aligned to timeframe {timeframe.value}")
