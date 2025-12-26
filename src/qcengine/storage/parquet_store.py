@@ -89,7 +89,7 @@ class ParquetCandleStore(CandleStore):
         if start:
             frame = frame[frame["bar_start_ts_utc"] >= pd.Timestamp(ensure_utc(start))]
         if end:
-            frame = frame[frame["bar_start_ts_utc"] <= pd.Timestamp(ensure_utc(end))]
+            frame = frame[frame["bar_start_ts_utc"] < pd.Timestamp(ensure_utc(end))]
 
         frame = frame.sort_values("bar_start_ts_utc")
 
