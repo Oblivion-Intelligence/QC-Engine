@@ -18,6 +18,7 @@ from qcengine.adapters.base import (
     Unavailable,
 )
 from qcengine.domain.marketdata import Candle, Timeframe, ensure_utc
+from qcengine.domain.time_windows import Window
 from qcengine.storage.base import AppendResult, CandleStore
 
 logger = logging.getLogger(__name__)
@@ -37,25 +38,30 @@ class BackfillJob:
     def run(self) -> None:
         """Execute the backfill over all instruments and timeframes."""
 
-        start = ensure_utc(self.start_utc)
-        end = ensure_utc(self.end_utc)
+        window = Window(ensure_utc(self.start_utc), ensure_utc(self.end_utc))
 
         for instrument in self.instruments:
             for timeframe in self.timeframes:
-                self._run_single(instrument, timeframe, start, end)
+                self._run_single(instrument, timeframe, window)
 
     def _run_single(
-        self, instrument: InstrumentRef, timeframe: Timeframe, start: datetime, end: datetime
+        self, instrument: InstrumentRef, timeframe: Timeframe, window: Window
     ) -> None:
-        candles = self._fetch_with_retry(instrument, timeframe, start, end)
+        candles = [
+            candle
+            for candle in self._fetch_with_retry(
+                instrument, timeframe, window.start_utc, window.end_utc
+            )
+            if window.contains(candle.bar_start_ts_utc)
+        ]
         if not candles:
             logger.info(
                 "backfill returned no candles",
                 extra={
                     "instrument_id": instrument.instrument_id,
                     "timeframe": timeframe.value,
-                    "start_utc": start.isoformat(),
-                    "end_utc": end.isoformat(),
+                    "start_utc": window.start_utc.isoformat(),
+                    "end_utc": window.end_utc.isoformat(),
                 },
             )
             return
@@ -67,8 +73,8 @@ class BackfillJob:
             extra={
                 "instrument_id": instrument.instrument_id,
                 "timeframe": timeframe.value,
-                "requested_start": start.isoformat(),
-                "requested_end": end.isoformat(),
+                "requested_start": window.start_utc.isoformat(),
+                "requested_end": window.end_utc.isoformat(),
                 "returned": len(candles),
                 "written": result.written,
                 "duplicates": result.duplicates,

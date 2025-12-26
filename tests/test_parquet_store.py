@@ -57,6 +57,42 @@ def test_read_filters_and_utc(tmp_path):
 
     candles = store.read("AAPL", Timeframe.MIN_1, start=start, end=end)
 
-    assert [c.bar_start_ts_utc.minute for c in candles] == [2, 3]
+    assert [c.bar_start_ts_utc.minute for c in candles] == [2]
     assert all(c.bar_start_ts_utc.tzinfo is not None for c in candles)
     assert all(c.bar_start_ts_utc.utcoffset() == timedelta(0) for c in candles)
+
+
+def test_read_uses_half_open_intervals(tmp_path) -> None:
+    store = ParquetCandleStore(tmp_path)
+    instrument = "ABC"
+    timeframe = Timeframe.MIN_1
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    candles = [
+        Candle(
+            instrument_id=instrument,
+            timeframe=timeframe,
+            bar_start_ts_utc=start + timedelta(minutes=i),
+            open=100 + i,
+            high=101 + i,
+            low=99 + i,
+            close=100 + i,
+            volume=1_000 + i,
+            source="test",
+            available_ts_utc=start,
+        )
+        for i in range(3)
+    ]
+
+    store.append(candles)
+
+    first_window_end = start + timedelta(minutes=2)
+    first_window = store.read(instrument, timeframe, start=start, end=first_window_end)
+    assert [c.bar_start_ts_utc for c in first_window] == [c.bar_start_ts_utc for c in candles[:2]]
+
+    second_window = store.read(
+        instrument,
+        timeframe,
+        start=first_window_end,
+        end=first_window_end + timedelta(minutes=1),
+    )
+    assert [c.bar_start_ts_utc for c in second_window] == [candles[2].bar_start_ts_utc]
