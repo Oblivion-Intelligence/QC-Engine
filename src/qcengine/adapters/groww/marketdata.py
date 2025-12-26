@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from qcengine.adapters.base import InvalidResponse, MarketDataAdapter, InstrumentRef
@@ -15,6 +15,7 @@ class GrowwMarketDataAdapter(MarketDataAdapter):
     """Adapter that normalizes Groww raw candles into canonical :class:`Candle`."""
 
     provider_name: str = "groww"
+    timestamp_semantics: str = "bar_end"
 
     def __init__(self, client: Any) -> None:
         if client is None:
@@ -45,20 +46,22 @@ class GrowwMarketDataAdapter(MarketDataAdapter):
             raise InvalidResponse(self.provider_name, "start_utc must be earlier than end_utc")
 
         raw = self._client.get_historical_candles_raw(instrument, timeframe, start_utc, end_utc)
-        candles = _parse_raw_to_candles(raw, instrument, timeframe)
+        candles = _parse_raw_to_candles(raw, instrument, timeframe, self.timestamp_semantics)
         candles.sort(key=lambda c: c.bar_start_ts_utc)
         _assert_sorted(candles)
         return candles
 
 
-def _parse_raw_to_candles(raw: Any, instrument: InstrumentRef, timeframe: Timeframe) -> list[Candle]:
+def _parse_raw_to_candles(
+    raw: Any, instrument: InstrumentRef, timeframe: Timeframe, timestamp_semantics: str
+) -> list[Candle]:
     rows = _extract_rows(raw)
     available_ts = now_utc()
     candles: list[Candle] = []
 
     for row in rows:
         try:
-            bar_start = _parse_timestamp(row)
+            bar_start = _parse_timestamp(row, timeframe, timestamp_semantics)
             open_, high, low, close, volume = _parse_ohlcv(row)
             candles.append(
                 Candle(
@@ -98,7 +101,7 @@ def _extract_rows(raw: Any) -> Iterable[Any]:
     return rows
 
 
-def _parse_timestamp(row: Any) -> datetime:
+def _parse_timestamp(row: Any, timeframe: Timeframe, timestamp_semantics: str) -> datetime:
     if isinstance(row, dict):
         ts = row.get("t") or row.get("timestamp") or row.get("time")
     elif isinstance(row, (list, tuple)) and len(row) >= 1:
@@ -116,7 +119,11 @@ def _parse_timestamp(row: Any) -> datetime:
     else:
         raise InvalidResponse("groww", "unsupported timestamp type")
 
-    return ensure_utc(dt)
+    ts_utc = ensure_utc(dt)
+    if timestamp_semantics == "bar_end":
+        ts_utc -= timedelta(minutes=timeframe.to_minutes())
+    _assert_aligned_to_timeframe(ts_utc, timeframe)
+    return ts_utc
 
 
 def _parse_ohlcv(row: Any) -> tuple[float, float, float, float, float | None]:
@@ -145,3 +152,12 @@ def _assert_sorted(candles: Iterable[Candle]) -> None:
         if previous and candle.bar_start_ts_utc < previous:
             raise InvalidResponse("groww", "candles must be sorted ascending by bar_start_ts_utc")
         previous = candle.bar_start_ts_utc
+
+
+def _assert_aligned_to_timeframe(ts: datetime, timeframe: Timeframe) -> None:
+    delta_seconds = timeframe.to_minutes() * 60
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    remainder = (ts - epoch).total_seconds() % delta_seconds
+    tolerance = 1e-6
+    if remainder > tolerance and abs(delta_seconds - remainder) > tolerance:
+        raise InvalidResponse("groww", f"candle timestamp {ts.isoformat()} not aligned to timeframe {timeframe.value}")
