@@ -6,7 +6,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from qcengine.adapters.base import InvalidResponse, MarketDataAdapter, InstrumentRef
-from qcengine.domain.marketdata import Candle, Timeframe, ensure_utc, now_utc
+from qcengine.domain.marketdata import (
+    Candle,
+    Timeframe,
+    assert_aligned_to_grid,
+    ensure_utc,
+    now_utc,
+)
 
 EPOCH_UNIT = "s"
 
@@ -122,7 +128,10 @@ def _parse_timestamp(row: Any, timeframe: Timeframe, timestamp_semantics: str) -
     ts_utc = ensure_utc(dt)
     if timestamp_semantics == "bar_end":
         ts_utc -= timedelta(minutes=timeframe.to_minutes())
-    _assert_aligned_to_timeframe(ts_utc, timeframe)
+    try:
+        assert_aligned_to_grid(ts_utc, timeframe)
+    except ValueError as exc:
+        raise InvalidResponse("groww", str(exc)) from exc
     return ts_utc
 
 
@@ -152,12 +161,3 @@ def _assert_sorted(candles: Iterable[Candle]) -> None:
         if previous and candle.bar_start_ts_utc < previous:
             raise InvalidResponse("groww", "candles must be sorted ascending by bar_start_ts_utc")
         previous = candle.bar_start_ts_utc
-
-
-def _assert_aligned_to_timeframe(ts: datetime, timeframe: Timeframe) -> None:
-    delta_seconds = timeframe.to_minutes() * 60
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    remainder = (ts - epoch).total_seconds() % delta_seconds
-    tolerance = 1e-6
-    if remainder > tolerance and abs(delta_seconds - remainder) > tolerance:
-        raise InvalidResponse("groww", f"candle timestamp {ts.isoformat()} not aligned to timeframe {timeframe.value}")

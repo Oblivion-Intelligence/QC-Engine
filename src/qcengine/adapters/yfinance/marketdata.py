@@ -16,7 +16,13 @@ from qcengine.adapters.base import (
     RateLimited,
     Unavailable,
 )
-from qcengine.domain.marketdata import Candle, Timeframe, ensure_utc, now_utc
+from qcengine.domain.marketdata import (
+    Candle,
+    Timeframe,
+    assert_aligned_to_grid,
+    ensure_utc,
+    now_utc,
+)
 
 
 _INTERVAL_MAP: dict[Timeframe, str] = {
@@ -157,14 +163,8 @@ def _normalize_bar_timestamp(ts: datetime, timeframe: Timeframe, timestamp_seman
     ts_utc = ensure_utc(ts)
     if timestamp_semantics == "bar_end":
         ts_utc -= timedelta(minutes=timeframe.to_minutes())
-    _assert_aligned_to_timeframe(ts_utc, timeframe)
+    try:
+        assert_aligned_to_grid(ts_utc, timeframe)
+    except ValueError as exc:
+        raise InvalidResponse("yfinance", str(exc)) from exc
     return ts_utc
-
-
-def _assert_aligned_to_timeframe(ts: datetime, timeframe: Timeframe) -> None:
-    delta_seconds = timeframe.to_minutes() * 60
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    remainder = (ts - epoch).total_seconds() % delta_seconds
-    tolerance = 1e-6
-    if remainder > tolerance and abs(delta_seconds - remainder) > tolerance:
-        raise InvalidResponse("yfinance", f"candle timestamp {ts.isoformat()} not aligned to timeframe {timeframe.value}")

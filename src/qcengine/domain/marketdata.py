@@ -78,6 +78,41 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def assert_aligned_to_grid(ts_utc: datetime, timeframe: Timeframe) -> None:
+    """Ensure a timestamp lies on the expected timeframe grid.
+
+    Alignment rules:
+
+    - ``MIN_1``/``MIN_5``/``MIN_15``/``HOUR_1``: the Unix timestamp modulo the
+      timeframe length in seconds must be zero (with small float tolerance).
+    - ``DAY_1``: the timestamp must be exactly ``00:00:00`` UTC.
+
+    Args:
+        ts_utc: Timestamp to validate (timezone-aware).
+        timeframe: Candle resolution to validate against.
+
+    Raises:
+        ValueError: If the timestamp is not aligned to the timeframe grid.
+    """
+
+    ts = ensure_utc(ts_utc)
+
+    if timeframe is Timeframe.DAY_1:
+        if ts.hour or ts.minute or ts.second or ts.microsecond:
+            raise ValueError(
+                f"timestamp {ts.isoformat()} not aligned to timeframe grid {timeframe.value}"
+            )
+        return
+
+    delta_seconds = timeframe.to_minutes() * 60
+    remainder = ts.timestamp() % delta_seconds
+    tolerance = 1e-6
+    if remainder > tolerance and abs(delta_seconds - remainder) > tolerance:
+        raise ValueError(
+            f"timestamp {ts.isoformat()} not aligned to timeframe grid {timeframe.value}"
+        )
+
+
 @dataclass
 class Candle:
     """Canonical OHLCV candle representation."""

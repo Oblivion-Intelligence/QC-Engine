@@ -14,7 +14,13 @@ from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
 
-from qcengine.domain.marketdata import Candle, Timeframe, ensure_utc, now_utc
+from qcengine.domain.marketdata import (
+    Candle,
+    Timeframe,
+    assert_aligned_to_grid,
+    ensure_utc,
+    now_utc,
+)
 
 
 @dataclass
@@ -67,6 +73,7 @@ def normalize_rows(
 
     for row in rows:
         bar_start = _extract_timestamp(row, spec)
+        assert_aligned_to_grid(bar_start, timeframe)
         open_, high, low, close = (
             _extract_numeric(row, spec.open),
             _extract_numeric(row, spec.high),
@@ -121,11 +128,13 @@ def normalize_dataframe(
     candles: list[Candle] = []
 
     for ts, row in df.iterrows():
+        bar_start = ensure_utc(ts.to_pydatetime())
+        assert_aligned_to_grid(bar_start, timeframe)
         candles.append(
             Candle(
                 instrument_id=instrument_id,
                 timeframe=timeframe,
-                bar_start_ts_utc=ensure_utc(ts.to_pydatetime()),
+                bar_start_ts_utc=bar_start,
                 open=float(row["Open"]),
                 high=float(row["High"]),
                 low=float(row["Low"]),
