@@ -14,8 +14,8 @@ def test_normalize_rows_sorts_and_stamps_available(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr("qcengine.ingestion.normalize.now_utc", lambda: fixed_now)
 
     rows = [
-        {"t": 1_700_000_600, "o": 11.0, "h": 12.0, "l": 10.0, "c": 11.5, "v": 150},
-        {"t": 1_700_000_000, "o": 10.0, "h": 11.0, "l": 9.5, "c": 10.5, "v": 100},
+        {"t": 1_699_999_800, "o": 11.0, "h": 12.0, "l": 10.0, "c": 11.5, "v": 150},
+        {"t": 1_699_999_500, "o": 10.0, "h": 11.0, "l": 9.5, "c": 10.5, "v": 100},
     ]
 
     candles = normalize_rows(
@@ -32,7 +32,7 @@ def test_normalize_rows_sorts_and_stamps_available(monkeypatch: pytest.MonkeyPat
 
 
 def test_normalize_rows_epoch_ms() -> None:
-    rows = [[1_700_000_000_000, 10, 11, 9.5, 10.5, 100]]
+    rows = [[1_699_999_980_000, 10, 11, 9.5, 10.5, 100]]
 
     candles = normalize_rows(
         rows,
@@ -80,3 +80,18 @@ def test_normalize_dataframe_sorts() -> None:
     candles = normalize_dataframe(df, instrument_id="ABC", timeframe=Timeframe.MIN_1, source="test")
 
     assert [c.bar_start_ts_utc for c in candles] == sorted(c.bar_start_ts_utc for c in candles)
+
+
+def test_normalize_rejects_misaligned_timestamp() -> None:
+    rows = [
+        {"t": "2024-01-01T00:01:00+00:00", "o": 10, "h": 11, "l": 9, "c": 10},
+    ]
+
+    with pytest.raises(ValueError, match="aligned"):
+        normalize_rows(
+            rows,
+            instrument_id="ABC",
+            timeframe=Timeframe.MIN_5,
+            source="test",
+            spec=NormalizationSpec(timestamp="t", open="o", high="h", low="l", close="c"),
+        )

@@ -10,7 +10,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from qcengine.domain.marketdata import Candle, Timeframe, ensure_utc
+from qcengine.domain.marketdata import Candle, Timeframe, assert_aligned_to_grid, ensure_utc
 from qcengine.storage.base import AppendResult, CandleStore
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,9 @@ class ParquetCandleStore(CandleStore):
         if not candles:
             logger.info("parquet store append called with no candles")
             return AppendResult(written=0, duplicates=0)
+
+        for candle in candles:
+            assert_aligned_to_grid(candle.bar_start_ts_utc, candle.timeframe)
 
         written_total = 0
         duplicates_total = 0

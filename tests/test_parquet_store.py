@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from qcengine.domain.marketdata import Candle, Timeframe
 from qcengine.storage.parquet_store import ParquetCandleStore
 
@@ -45,6 +47,25 @@ def test_append_and_deduplicate(tmp_path):
     )
     assert len(candles) == 4
     assert candles[-1].bar_start_ts_utc.minute == 3
+
+
+def test_append_rejects_misaligned_candles(tmp_path) -> None:
+    store = ParquetCandleStore(tmp_path)
+    misaligned = Candle(
+        instrument_id="AAPL",
+        timeframe=Timeframe.MIN_5,
+        bar_start_ts_utc=datetime(2024, 1, 1, 0, 1, tzinfo=timezone.utc),
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.5,
+        volume=10_000,
+        source="test",
+        available_ts_utc=datetime(2024, 1, 1, 0, 1, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(ValueError, match="aligned"):
+        store.append([misaligned])
 
 
 def test_read_filters_and_utc(tmp_path):

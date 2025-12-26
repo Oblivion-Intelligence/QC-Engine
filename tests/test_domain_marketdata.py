@@ -8,7 +8,7 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from qcengine.domain.marketdata import Candle, Timeframe, ensure_utc
+from qcengine.domain.marketdata import Candle, Timeframe, assert_aligned_to_grid, ensure_utc
 
 
 def test_timeframe_minutes_and_from_minutes() -> None:
@@ -127,3 +127,18 @@ def test_ensure_utc_converts_offsets() -> None:
 
     assert normalized.tzinfo is timezone.utc
     assert normalized == datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
+
+
+def test_assert_aligned_to_grid_accepts_valid_boundaries() -> None:
+    assert_aligned_to_grid(datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc), Timeframe.MIN_1)
+    assert_aligned_to_grid(datetime(2024, 1, 1, 0, 5, tzinfo=timezone.utc), Timeframe.MIN_5)
+    assert_aligned_to_grid(datetime(2024, 1, 1, 0, 15, tzinfo=timezone.utc), Timeframe.MIN_15)
+    assert_aligned_to_grid(datetime(2024, 1, 1, 1, 0, tzinfo=timezone.utc), Timeframe.HOUR_1)
+    assert_aligned_to_grid(datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc), Timeframe.DAY_1)
+
+
+def test_assert_aligned_to_grid_rejects_misaligned_timestamp() -> None:
+    with pytest.raises(ValueError, match="not aligned"):
+        assert_aligned_to_grid(datetime(2024, 1, 1, 0, 2, tzinfo=timezone.utc), Timeframe.MIN_5)
+    with pytest.raises(ValueError, match="not aligned"):
+        assert_aligned_to_grid(datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc), Timeframe.DAY_1)
