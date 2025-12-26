@@ -44,14 +44,31 @@ class ParquetCandleStore(CandleStore):
 
             combined_df = (
                 pd.concat([existing_df, new_df]) if existing_df is not None else new_df
+            ).reset_index(drop=True)
+
+            combined_df["_arrival_order"] = combined_df.index
+            combined_df["_has_volume"] = combined_df["volume"].notna()
+            combined_df["_has_ohlc"] = combined_df[["open", "high", "low", "close"]].notna().all(axis=1)
+
+            combined_df = combined_df.sort_values(
+                [
+                    "bar_start_ts_utc",
+                    "available_ts_utc",
+                    "_has_volume",
+                    "_has_ohlc",
+                    "_arrival_order",
+                ],
+                ascending=[True, False, False, False, True],
+                kind="mergesort",
             )
+
             combined_count = len(combined_df)
-            deduped_df = (
-                combined_df.drop_duplicates(
-                    subset=["instrument_id", "timeframe", "bar_start_ts_utc"], keep="last"
-                )
-                .sort_values("bar_start_ts_utc")
-                .reset_index(drop=True)
+            deduped_df = combined_df.drop_duplicates(
+                subset=["instrument_id", "timeframe", "bar_start_ts_utc"], keep="first"
+            )
+
+            deduped_df = deduped_df.sort_values("bar_start_ts_utc").drop(
+                columns=["_arrival_order", "_has_volume", "_has_ohlc"]
             )
 
             duplicates = combined_count - len(deduped_df)

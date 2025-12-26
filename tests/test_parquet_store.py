@@ -24,6 +24,123 @@ def _make_candle(minute_offset: int, instrument: str = "AAPL", timeframe: Timefr
     )
 
 
+def test_append_uses_dominance_rule(tmp_path) -> None:
+    store = ParquetCandleStore(tmp_path)
+
+    base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    instrument = "AAPL"
+    timeframe = Timeframe.MIN_1
+
+    older_available = Candle(
+        instrument_id=instrument,
+        timeframe=timeframe,
+        bar_start_ts_utc=base,
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.5,
+        volume=10_000,
+        source="test",
+        available_ts_utc=base + timedelta(seconds=1),
+    )
+
+    newer_available_missing_volume = Candle(
+        instrument_id=instrument,
+        timeframe=timeframe,
+        bar_start_ts_utc=base,
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.5,
+        volume=None,
+        source="test",
+        available_ts_utc=base + timedelta(seconds=2),
+    )
+
+    missing_volume = Candle(
+        instrument_id=instrument,
+        timeframe=timeframe,
+        bar_start_ts_utc=base + timedelta(minutes=1),
+        open=101.0,
+        high=102.0,
+        low=100.0,
+        close=101.5,
+        volume=None,
+        source="test",
+        available_ts_utc=base + timedelta(seconds=1),
+    )
+
+    with_volume = Candle(
+        instrument_id=instrument,
+        timeframe=timeframe,
+        bar_start_ts_utc=base + timedelta(minutes=1),
+        open=101.0,
+        high=102.0,
+        low=100.0,
+        close=101.5,
+        volume=20_000,
+        source="test",
+        available_ts_utc=base + timedelta(seconds=1),
+    )
+
+    stable_first = Candle(
+        instrument_id=instrument,
+        timeframe=timeframe,
+        bar_start_ts_utc=base + timedelta(minutes=2),
+        open=102.0,
+        high=103.0,
+        low=101.0,
+        close=102.5,
+        volume=None,
+        source="test",
+        available_ts_utc=base + timedelta(seconds=1),
+    )
+
+    stable_second = Candle(
+        instrument_id=instrument,
+        timeframe=timeframe,
+        bar_start_ts_utc=base + timedelta(minutes=2),
+        open=102.0,
+        high=103.0,
+        low=101.0,
+        close=102.5,
+        volume=None,
+        source="test",
+        available_ts_utc=base + timedelta(seconds=1),
+    )
+
+    store.append([older_available, missing_volume, stable_first])
+    store.append([newer_available_missing_volume, with_volume, stable_second])
+
+    candles = store.read(instrument, timeframe)
+    by_start = {c.bar_start_ts_utc: c for c in candles}
+
+    assert by_start[base].available_ts_utc == newer_available_missing_volume.available_ts_utc
+    assert by_start[base].volume is None
+
+    assert by_start[base + timedelta(minutes=1)].volume == with_volume.volume
+
+    assert by_start[base + timedelta(minutes=2)].available_ts_utc == stable_first.available_ts_utc
+
+    # Deterministic across chunking orders
+    reordered_store = ParquetCandleStore(tmp_path / "reordered")
+    reordered_store.append(
+        [
+            newer_available_missing_volume,
+            with_volume,
+            stable_second,
+            older_available,
+            missing_volume,
+            stable_first,
+        ]
+    )
+
+    reordered = reordered_store.read(instrument, timeframe)
+    assert [(c.bar_start_ts_utc, c.volume, c.available_ts_utc) for c in reordered] == [
+        (c.bar_start_ts_utc, c.volume, c.available_ts_utc) for c in candles
+    ]
+
+
 def test_append_and_deduplicate(tmp_path):
     store = ParquetCandleStore(tmp_path)
 
